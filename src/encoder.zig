@@ -8,6 +8,7 @@
 //! `[A-Za-z0-9_-]` are quoted; strings escape control characters.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const StringArrayHashMap = std.array_hash_map.String;
@@ -113,8 +114,8 @@ pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator, 
 /// a rename collision keeps declaration order. `sort_keys` iterates this order
 /// per structural pass; a flattened field's members sort within their own
 /// group at the flattened field's position, not interleaved with siblings.
-fn sortedFieldOrder(comptime T: type) [@typeInfo(T).@"struct".fields.len]usize {
-    const fields = @typeInfo(T).@"struct".fields;
+fn sortedFieldOrder(comptime T: type) [compat.structInfo(T).fields.len]usize {
+    const fields = (comptime compat.structInfo(T)).fields;
     var order: [fields.len]usize = undefined;
     for (0..fields.len) |i| order[i] = i;
     for (1..fields.len) |i| {
@@ -145,7 +146,7 @@ fn encodeTaggedUnion(
     const tag_field = T.toml_tag;
     const active_tag = std.meta.activeTag(value);
 
-    inline for (@typeInfo(T).@"union".fields) |union_field| {
+    inline for ((comptime compat.unionInfo(T)).fields) |union_field| {
         if (active_tag == @field(std.meta.Tag(T), union_field.name)) {
             const variant_name = union_field.name;
             const effective_name = comptime renamedKey(T, variant_name);
@@ -208,7 +209,7 @@ fn emitStructSubTables(
     has_any_kv: *bool,
     options: EncodeOptions,
 ) EncodeError!void {
-    const s = @typeInfo(T).@"struct";
+    const s = comptime compat.structInfo(T);
     if (options.sort_keys) {
         inline for (comptime sortedFieldOrder(T)) |fi| {
             try emitSubTableField(T, s.fields[fi], value, w, path, path_alloc, arena, is_root, has_any_kv, options);
@@ -222,7 +223,7 @@ fn emitStructSubTables(
 
 fn emitSubTableField(
     comptime T: type,
-    comptime field: std.builtin.Type.StructField,
+    comptime field: compat.Field,
     value: T,
     w: *std.Io.Writer,
     path: *ArrayList([]const u8),
@@ -311,7 +312,7 @@ fn emitFlatScalars(
     has_any_kv: *bool,
     options: EncodeOptions,
 ) EncodeError!void {
-    const s = @typeInfo(T).@"struct";
+    const s = comptime compat.structInfo(T);
     if (options.sort_keys) {
         inline for (comptime sortedFieldOrder(T)) |fi| {
             try emitScalarField(T, s.fields[fi], value, w, arena, has_any_kv, options);
@@ -325,7 +326,7 @@ fn emitFlatScalars(
 
 fn emitScalarField(
     comptime T: type,
-    comptime field: std.builtin.Type.StructField,
+    comptime field: compat.Field,
     value: T,
     w: *std.Io.Writer,
     arena: std.mem.Allocator,
@@ -388,7 +389,7 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
     if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "toToml"))) {
         comptime {
             const fn_info = @typeInfo(@TypeOf(T.toToml)).@"fn";
-            if (fn_info.params.len != 2) {
+            if (fn_info.param_types.len != 2) {
                 @compileError(@typeName(T) ++ ".toToml must take exactly 2 params: (Self, Allocator)");
             }
         }
@@ -406,7 +407,7 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
             break :blk w.print("{d}", .{i});
         },
         .float, .comptime_float => writeFloat(w, @floatCast(value)),
-        .pointer => |p| if (p.size == .slice and p.child == u8 and p.is_const)
+        .pointer => |p| if (p.size == .slice and p.child == u8 and p.attrs.@"const")
             writeQuotedString(w, value)
         else if (p.size == .slice) blk: {
             try w.writeByte('[');
@@ -1474,7 +1475,7 @@ test "encode multiline string: CR escaped as \\r, CRLF round-trip byte-exact" {
     // Build the initial value by parsing a single-line TOML that uses \r\n
     // escape sequences. The decoded string has literal CR and LF bytes. At
     // 62 bytes (>= multiline_threshold=60, has LF) it re-encodes as multiline.
-    const toml_src = "v = \"\\r\\n" ++ ("x" ** 60) ++ "\"\n";
+    const toml_src = "v = \"\\r\\n" ++ repeatX(60) ++ "\"\n";
     var arena1: ArenaAllocator = .init(testing.allocator);
     defer arena1.deinit();
     const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
@@ -1496,7 +1497,7 @@ test "encode multiline string: CR escaped as \\r, CRLF round-trip byte-exact" {
 
 test "encode multiline string: multiple CRs and CRLF pairs all escaped" {
     // "start\r\n" ++ 58*'x' ++ "\r\nend" -> 70-byte value (>= 60, has LF).
-    const toml_src = "v = \"start\\r\\n" ++ ("x" ** 58) ++ "\\r\\nend\"\n";
+    const toml_src = "v = \"start\\r\\n" ++ repeatX(58) ++ "\\r\\nend\"\n";
     var arena1: ArenaAllocator = .init(testing.allocator);
     defer arena1.deinit();
     const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
@@ -1972,4 +1973,10 @@ test "sort_keys: typed sub-tables sorted after scalars, by renamed key" {
         \\yy = 10
         \\
     , aw.written());
+}
+
+/// `n` copies of `x`, for test inputs (the `**` operator is gone in Zig 0.17).
+fn repeatX(comptime n: usize) *const [n]u8 {
+    const a: [n]u8 = @splat('x');
+    return &a;
 }
