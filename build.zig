@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(fuzz_exe);
         const run_fuzz = b.addRunArtifact(fuzz_exe);
-        if (b.args) |args| run_fuzz.addArgs(args);
+        run_fuzz.addPassthruArgs();
         const fuzz_step = b.step("fuzz", "Run the random-input fuzzer (pass --iters N etc. via -- )");
         fuzz_step.dependOn(&run_fuzz.step);
 

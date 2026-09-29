@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Build with Zig 0.17 (master): struct and union reflection goes through
+  `src/compat.zig` (Zig 0.17 split `fields` into `field_names` /
+  `field_types` / `field_attrs`), `@Tuple` replaces `std.meta.Tuple`,
+  pointer constness is read from `attrs`, and `zig build fuzz -- …` forwards
+  its arguments with `addPassthruArgs`.
+
 ## [0.6.0] - 2026-07-22
 
 ### Added
