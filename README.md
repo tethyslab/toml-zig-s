@@ -229,6 +229,17 @@ if (v.locate(spans, "server.port")) |port| {
 
 Array elements use `[N]` index segments, e.g. `users[0].name`.
 
+`spans` holds the span of each value. `key_spans`, keyed by the same paths,
+holds the span of the key that defines each key-value and each table:
+`server` in `[server]`, `points` in the header of element `points[1]`, and
+for an implicitly created table (`a` in `[a.b]`) the segment that created it.
+
+```zig
+var key_spans: toml.Spans = .empty;
+_ = try toml.parse(arena, src, .{ .key_spans = &key_spans });
+const header = key_spans.get("server").?; // `server` in `[server]`
+```
+
 ### Streaming input
 
 ```zig
@@ -386,7 +397,11 @@ to 100 diagnostics per parse. Set it to `null` for single-error mode
 
 Typed decoding (`parseInto`, `decode`) does the same: with `errors` set it
 reports every unknown key and every field or element that fails to decode,
-each with its key path, and returns the first error.
+each with its key path, and returns the first error. Each diagnostic
+also carries a source span: the value for a type or range error, the key
+for an unknown key, the key or header of the table for a missing key (none
+for the root table). `parseInto` records the span maps it needs; for
+`decode`, pass the `spans` and `key_spans` maps filled by the parse.
 
 ## API surface
 

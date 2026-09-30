@@ -25,6 +25,12 @@
 //! Without `ParseOptions.errors` decoding stops at the first error. With it,
 //! decoding goes on past a failing key, field or element, so every unknown
 //! key and every decode error gets a diagnostic; the first error is returned.
+//!
+//! A diagnostic carries a source span when `ParseOptions.spans` and
+//! `ParseOptions.key_spans` hold the maps filled by the parse of the decoded
+//! value (`parseInto` fills them itself when `errors` is set): a value error
+//! points at the value, an unknown key at the key, a missing key at the key or
+//! header of the table that lacks it. The root table has no span.
 
 const std = @import("std");
 const compat = @import("compat.zig");
@@ -36,6 +42,7 @@ const Value = value_mod.Value;
 const Date = value_mod.Date;
 const Time = value_mod.Time;
 const DateTime = value_mod.DateTime;
+const Span = value_mod.Span;
 const parser_mod = @import("parser.zig");
 const lev = @import("levenshtein.zig");
 
@@ -77,14 +84,48 @@ const PathBuilder = struct {
     }
 };
 
+/// What a decode diagnostic points at in the source.
+const At = union(enum) {
+    /// The value at the current path (type, range and enum errors).
+    value,
+    /// The table at the current path (a missing key); none for the root.
+    table,
+    /// The given key of the table at the current path (an unknown key).
+    key: []const u8,
+};
+
+/// The source span a diagnostic points at, looked up by path in the span
+/// maps of `options` (filled by the parse of the decoded value). A zero-width
+/// span when the maps are absent or the place has no span (the root table).
+fn diagSpan(arena: Allocator, options: parser_mod.ParseOptions, path: []const u8, at: At) Allocator.Error!Span {
+    const none: Span = .{ .start = 0, .end = 0 };
+    const found = switch (at) {
+        .value => lookupSpan(options.spans, path) orelse lookupSpan(options.key_spans, path),
+        .table => lookupSpan(options.key_spans, path) orelse lookupSpan(options.spans, path),
+        .key => |k| blk: {
+            if (options.key_spans == null and options.spans == null) break :blk null;
+            const key_path = if (path.len == 0) k else try std.fmt.allocPrint(arena, "{s}.{s}", .{ path, k });
+            break :blk lookupSpan(options.key_spans, key_path) orelse lookupSpan(options.spans, key_path);
+        },
+    };
+    return found orelse none;
+}
+
+fn lookupSpan(map: ?*const value_mod.Spans, path: []const u8) ?Span {
+    if (path.len == 0) return null;
+    const m = map orelse return null;
+    return m.get(path);
+}
+
 /// Append a decode diagnostic (formatted message + current path context +
-/// optional "did you mean" suggestion) to the caller-provided errors sink,
-/// if any. Everything is duped into the parse arena, matching Diagnostic's
-/// ownership contract.
+/// source span + optional "did you mean" suggestion) to the caller-provided
+/// errors sink, if any. Everything is duped into the parse arena, matching
+/// Diagnostic's ownership contract.
 fn addDiagSuggest(
     arena: Allocator,
     options: parser_mod.ParseOptions,
     path: *const PathBuilder,
+    at: At,
     suggestion: ?[]const u8,
     comptime fmt: []const u8,
     args: anytype,
@@ -94,12 +135,14 @@ fn addDiagSuggest(
     const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
     try list.append(arena, .{
         .message = msg,
+        .span = try diagSpan(arena, options, path.slice(), at),
         .path = path_owned,
         .suggestion = if (suggestion) |sug| try arena.dupe(u8, sug) else null,
     });
 }
 
-/// addDiagSuggest without a suggestion; the common case.
+/// addDiagSuggest for the value at the current path without a suggestion;
+/// the common case.
 fn addDiag(
     arena: Allocator,
     options: parser_mod.ParseOptions,
@@ -107,7 +150,7 @@ fn addDiag(
     comptime fmt: []const u8,
     args: anytype,
 ) Allocator.Error!void {
-    return addDiagSuggest(arena, options, path, null, fmt, args);
+    return addDiagSuggest(arena, options, path, .value, null, fmt, args);
 }
 
 /// With an errors sink, a decode error of one key, field or element is
@@ -329,7 +372,7 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
             const key = entry.key_ptr.*;
             const suggestion = lev.closestMatch(key, comptime expectedKeys(T), lev.suggestionThreshold(key.len));
 
-            try addDiagSuggest(arena, options, path, suggestion, "unknown field `{s}`", .{key});
+            try addDiagSuggest(arena, options, path, .{ .key = key }, suggestion, "unknown field `{s}`", .{key});
             try keepGoing(options, &first, error.UnknownField);
         }
     }
@@ -358,6 +401,7 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
             const flat_opts: parser_mod.ParseOptions = .{
                 .errors = options.errors,
                 .spans = options.spans,
+                .key_spans = options.key_spans,
                 .ignore_unknown_fields = true,
             };
             if (decodeInner(field.type, arena, value, flat_opts, path)) |fv| {
@@ -381,7 +425,7 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
             @field(out, field.name) = null;
             seen[idx] = true;
         } else {
-            try addDiag(arena, options, path, "missing required field `{s}`", .{field.name});
+            try addDiagSuggest(arena, options, path, .table, null, "missing required field `{s}`", .{field.name});
             try keepGoing(options, &first, error.MissingField);
         }
     }
@@ -398,7 +442,7 @@ fn decodeTaggedUnion(comptime T: type, arena: Allocator, value: Value, options: 
     const tbl = value.table;
     const tag_field = T.toml_tag;
     const tag_value = tbl.get(tag_field) orelse {
-        try addDiag(arena, options, path, "missing required field `{s}`", .{tag_field});
+        try addDiagSuggest(arena, options, path, .table, null, "missing required field `{s}`", .{tag_field});
         return error.MissingField;
     };
     if (tag_value != .string) {
@@ -865,6 +909,103 @@ test "decode: float overflow has a diagnostic" {
     try testing.expectError(error.Overflow, decode(Config, arena.allocator(), v, .{ .errors = &errs }));
     try testing.expectEqual(@as(usize, 1), errs.items.len);
     try testing.expectEqualStrings("ratio", errs.items[0].path.?);
+}
+
+fn expectDiagAt(src: []const u8, d: parser_mod.Diagnostic, line: u32, col: u32) !void {
+    try testing.expect(d.span.end > d.span.start);
+    const lc = d.span.lineCol(src);
+    try testing.expectEqual(line, lc.line);
+    try testing.expectEqual(col, lc.col);
+}
+
+test "decode: parseInto puts source positions into diagnostics" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const toml_mod = @import("toml.zig");
+    try testing.expectError(error.UnknownField, toml_mod.parseInto(CollectConfig, arena.allocator(), collect_src, .{ .errors = &errs }));
+    try expectCollectDiagnostics(errs.items);
+    const e = errs.items;
+    try expectDiagAt(collect_src, e[0], 2, 1); // unknown key `bogus`: the key
+    try expectDiagAt(collect_src, e[1], 1, 8); // `name`: the value
+    // `id` is missing from the root table, which has no position.
+    try testing.expectEqual(e[2].span.start, e[2].span.end);
+    try expectDiagAt(collect_src, e[3], 3, 14); // ports[1]
+    try expectDiagAt(collect_src, e[4], 3, 27); // ports[3]
+    try expectDiagAt(collect_src, e[5], 4, 9); // ratio
+    try expectDiagAt(collect_src, e[6], 6, 8); // server.port
+}
+
+test "decode: a missing key points at the table that lacks it" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const src =
+        \\[server]
+        \\host = "h"
+        \\[[points]]
+        \\addr = 1
+        \\type = "a"
+        \\[[points]]
+        \\addr = 2
+        \\inline = { a = 1 }
+        \\[a.b]
+        \\c = 1
+    ;
+    const C = struct {
+        server: struct { host: []const u8, port: u16 },
+        points: []const struct {
+            pub const toml_rename = .{ .in = "inline" };
+            addr: u16,
+            type: []const u8,
+            in: ?struct { a: u8, b: u8 } = null,
+        },
+        a: struct { b: struct { c: u8 }, d: u8 },
+    };
+    const toml_mod = @import("toml.zig");
+    try testing.expectError(error.MissingField, toml_mod.parseInto(C, arena.allocator(), src, .{ .errors = &errs }));
+
+    const e = errs.items;
+    try testing.expectEqual(@as(usize, 4), e.len);
+    try testing.expectEqualStrings("server", e[0].path.?);
+    try expectDiagAt(src, e[0], 1, 2); // `server` in `[server]`
+    try testing.expectEqualStrings("points[1]", e[1].path.?);
+    try expectDiagAt(src, e[1], 6, 3); // `points` in the second `[[points]]`
+    try testing.expectEqualStrings("points[1].inline", e[2].path.?);
+    try expectDiagAt(src, e[2], 8, 1); // the key of the inline table
+    try testing.expectEqualStrings("a", e[3].path.?);
+    try expectDiagAt(src, e[3], 9, 2); // `a` created implicitly by `[a.b]`
+}
+
+test "decode: without span maps diagnostics have no position" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const v = try parse(arena.allocator(), collect_src, .{});
+    try testing.expectError(error.UnknownField, decode(CollectConfig, arena.allocator(), v, .{ .errors = &errs }));
+    try expectCollectDiagnostics(errs.items);
+    for (errs.items) |d| try testing.expectEqual(d.span.start, d.span.end);
+}
+
+test "decode: decode takes positions from the caller's span maps" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    var spans: value_mod.Spans = .empty;
+    var key_spans: value_mod.Spans = .empty;
+    const opts: parser_mod.ParseOptions = .{ .errors = &errs, .spans = &spans, .key_spans = &key_spans };
+    const v = try parse(arena.allocator(), collect_src, opts);
+    try testing.expectError(error.UnknownField, decode(CollectConfig, arena.allocator(), v, opts));
+    try expectDiagAt(collect_src, errs.items[0], 2, 1);
+    try expectDiagAt(collect_src, errs.items[6], 6, 8);
 }
 
 test "decode: toml_rename maps TOML key to struct field" {
@@ -1777,6 +1918,7 @@ pub fn streamParseInto(comptime T: type, arena: Allocator, src: []const u8, opti
     var stream_options = options;
     stream_options.errors = null;
     stream_options.spans = null;
+    stream_options.key_spans = null;
 
     const Ts = TypedSink(T);
     var sink = Ts.init(arena, stream_options);

@@ -109,10 +109,15 @@ pub const decode = decode_mod.decode;
 /// single statement-executor pass with no intermediate `Value` tree. On
 /// any error the input is re-decoded through the tree path, so
 /// diagnostics and error selection are always the canonical ones.
-/// Callers requesting `options.spans` use the tree path unconditionally.
+/// Callers requesting `options.spans` or `options.key_spans` use the tree
+/// path unconditionally.
+///
+/// With `options.errors` set, decode diagnostics carry source spans: the
+/// tree path records the span maps it needs, into the caller's maps when
+/// given, otherwise into its own.
 pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
     if (comptime decode_mod.needsTree(T)) return parseIntoTree(T, arena, src, options);
-    if (options.spans != null) return parseIntoTree(T, arena, src, options);
+    if (options.spans != null or options.key_spans != null) return parseIntoTree(T, arena, src, options);
     return decode_mod.streamParseInto(T, arena, src, options) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => parseIntoTree(T, arena, src, options),
@@ -120,8 +125,16 @@ pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, op
 }
 
 fn parseIntoTree(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
-    const value = try parse(arena, src, options);
-    return decode(T, arena, value, options);
+    var opts = options;
+    // Arena-allocated like the rest of the parse; nothing to free.
+    var spans: Spans = .empty;
+    var key_spans: Spans = .empty;
+    if (opts.errors != null) {
+        if (opts.spans == null) opts.spans = &spans;
+        if (opts.key_spans == null) opts.key_spans = &key_spans;
+    }
+    const value = try parse(arena, src, opts);
+    return decode(T, arena, value, opts);
 }
 
 /// Reader-input variant of `parseInto`.

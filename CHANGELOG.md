@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ParseOptions.key_spans`: a map, keyed like `spans`, of the span of the
+  key that defines each key-value and each table (`[header]` tables,
+  array-of-tables elements, implicitly created tables, inline-table keys).
+- Decode diagnostics carry a source span: a value error points at the
+  value, an unknown key at the key, a missing key at the key or header of
+  the table that lacks it (the root table has none). `parseInto` with
+  `errors` records the span maps itself; `decode` uses the `spans` /
+  `key_spans` maps passed in its options.
+
 ### Changed
 
 - Build with Zig 0.17 (master): struct and union reflection goes through

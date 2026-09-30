@@ -25,7 +25,8 @@ pub const Diagnostic = struct {
     message: []const u8,
     /// Byte range of the offending token within the original source. A
     /// zero-width span (`start == end`) marks a locationless error (e.g. a
-    /// decode type mismatch with no underlying token); line/col then resolve
+    /// decode error without span maps, or a key missing from the root
+    /// table; see `ParseOptions.key_spans`); line/col then resolve
     /// to the start of `src` and no source excerpt is rendered. Line and
     /// column are derived on demand via `Span.lineCol(src)`.
     span: Span = .{ .start = 0, .end = 0 },
@@ -138,6 +139,16 @@ pub const ParseOptions = struct {
     /// `Event.span` instead.
     spans: ?*v.Spans = null,
 
+    /// If non-null, populated with the Span of the key that defines each
+    /// key-value and each table, keyed by the same dotted paths as
+    /// `spans`: `port` in `port = 1`, `server` in `[server]`, `points` in
+    /// the `[[points]]` header of element `points[N]`, and, for a table
+    /// created implicitly (`a` in `[a.b]` or `a.b = 1`), the key segment
+    /// that first created it. Typed decoding uses it (with `spans`) to put
+    /// a source position into its diagnostics. Buffered parsing only, like
+    /// `spans`.
+    key_spans: ?*v.Spans = null,
+
     /// Decode-only. When true, TOML keys absent from the target struct
     /// are silently dropped instead of triggering `error.UnknownField`.
     /// Honored by parseInto / parseIntoReader / decode. Ignored by
@@ -216,6 +227,7 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
     p.root = &root;
     p.seen = &seen;
     p.spans = options.spans;
+    p.key_spans = options.key_spans;
     p.errors = options.errors;
     p.max_depth = options.max_depth;
     return p.parseDocument();
@@ -231,7 +243,7 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
 pub fn decodeKeyPathSegments(arena: Allocator, raw: []const u8) Error![]const []const u8 {
     var p = Parser.init(arena, raw);
     var parts: ArrayList([]const u8) = .empty;
-    p.parseKeyPath(&parts) catch return error.TomlParseError;
+    p.parseKeyPath(&parts, null) catch return error.TomlParseError;
     p.skipWs();
     if (!p.eof()) return error.TomlParseError;
     if (parts.items.len == 0) return error.TomlParseError;
@@ -481,11 +493,14 @@ pub fn ParserOf(comptime Sink: type) type {
         /// When non-null, populated with one entry per emitted value
         /// (path -> source span). Set via `ParseOptions.spans`.
         spans: ?*v.Spans = null,
+        /// When non-null, populated with one entry per defining key
+        /// (path -> key span). Set via `ParseOptions.key_spans`.
+        key_spans: ?*v.Spans = null,
         /// Mutable buffer holding the current value's full dotted path while
         /// inside `parseValue`. Composite parsers (`parseArray`,
         /// `parseInlineTable`) push child segments before recursing and
         /// restore the buffer length on exit. Only meaningful when
-        /// `spans != null`.
+        /// `tracksPaths()`.
         current_path: ArrayList(u8) = .empty,
 
         /// Bare init. Leaves `root` / `seen` undefined; the caller must either
@@ -531,10 +546,30 @@ pub fn ParserOf(comptime Sink: type) type {
             return .{ .start = self.token_start, .end = self.pos };
         }
 
+        /// Whether `current_path` is maintained: only when a span map is set.
+        fn tracksPaths(self: *const Self) bool {
+            return self.spans != null or self.key_spans != null;
+        }
+
+        /// Record the span of the key that defines `path`. With `overwrite`
+        /// false an existing entry is kept, so an implicitly created table
+        /// keeps the key segment that first created it. No-op when key spans
+        /// are disabled.
+        fn recordKeySpan(self: *Self, path: []const u8, span: Span, overwrite: bool) Error!void {
+            const km = self.key_spans orelse return;
+            const gop = try km.getOrPut(self.arena, path);
+            if (gop.found_existing) {
+                if (overwrite) gop.value_ptr.* = span;
+                return;
+            }
+            gop.key_ptr.* = try self.arena.dupe(u8, path);
+            gop.value_ptr.* = span;
+        }
+
         /// Append a child path segment, returning the previous length so the
         /// caller can restore via `popPath`. Cheap when spans are off.
         fn pushPath(self: *Self, separator: u8, segment: []const u8) Error!usize {
-            if (self.spans == null) return 0;
+            if (!self.tracksPaths()) return 0;
             const prev_len = self.current_path.items.len;
             if (prev_len > 0 and separator != 0) try self.current_path.append(self.arena, separator);
             try self.current_path.appendSlice(self.arena, segment);
@@ -543,14 +578,14 @@ pub fn ParserOf(comptime Sink: type) type {
 
         /// Append `[N]` index segment.
         fn pushIndex(self: *Self, idx: usize) Error!usize {
-            if (self.spans == null) return 0;
+            if (!self.tracksPaths()) return 0;
             const prev_len = self.current_path.items.len;
             try self.current_path.print(self.arena, "[{d}]", .{idx});
             return prev_len;
         }
 
         fn popPath(self: *Self, prev_len: usize) void {
-            if (self.spans == null) return;
+            if (!self.tracksPaths()) return;
             self.current_path.shrinkRetainingCapacity(prev_len);
         }
 
@@ -792,8 +827,10 @@ pub fn ParserOf(comptime Sink: type) type {
             self.token_start = self.pos;
             var key_parts: ArrayList([]const u8) = .empty;
             defer key_parts.deinit(self.arena);
+            var key_part_spans: ArrayList(Span) = .empty;
+            defer key_part_spans.deinit(self.arena);
 
-            try self.parseKeyPath(&key_parts);
+            try self.parseKeyPath(&key_parts, if (self.key_spans != null) &key_part_spans else null);
             self.skipWs();
 
             if (is_array) {
@@ -903,6 +940,12 @@ pub fn ParserOf(comptime Sink: type) type {
                         self.current_seen_prefix.clearRetainingCapacity();
                         try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
                         try self.current_seen_prefix.print(self.arena, "[{d}]", .{idx});
+                        if (self.key_spans != null) {
+                            // The array keeps its first header; each element
+                            // points at its own `[[...]]` header.
+                            try self.recordKeySpan(indexed_key.items, key_part_spans.items[i], false);
+                            try self.recordKeySpan(self.current_prefix.items, key_part_spans.items[i], true);
+                        }
                     } else {
                         try self.openTable(table, part, key_owned, indexed_seen_key.items, full_key.items);
                         if (comptime Sink.is_value_sink) {
@@ -914,8 +957,12 @@ pub fn ParserOf(comptime Sink: type) type {
                         try self.current_prefix.appendSlice(self.arena, indexed_key.items);
                         self.current_seen_prefix.clearRetainingCapacity();
                         try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
+                        // The defining header wins over a segment that
+                        // created the table implicitly before.
+                        if (self.key_spans != null) try self.recordKeySpan(indexed_key.items, key_part_spans.items[i], true);
                     }
                 } else {
+                    if (self.key_spans != null) try self.recordKeySpan(indexed_key.items, key_part_spans.items[i], false);
                     // Intermediate -- walk or create, but forbid traversing
                     // through scalars, inline tables, or arrays-of-tables
                     // (must target the last element of array-of-tables) or
@@ -1146,7 +1193,9 @@ pub fn ParserOf(comptime Sink: type) type {
             self.token_start = self.pos;
             var parts: ArrayList([]const u8) = .empty;
             defer parts.deinit(self.arena);
-            try self.parseKeyPath(&parts);
+            var part_spans: ArrayList(Span) = .empty;
+            defer part_spans.deinit(self.arena);
+            try self.parseKeyPath(&parts, if (self.key_spans != null) &part_spans else null);
             self.skipWs();
             if (!self.match('=')) return self.setError("expected '=' after key");
             self.skipWs();
@@ -1177,6 +1226,7 @@ pub fn ParserOf(comptime Sink: type) type {
                 try full_key.appendSlice(self.arena, part);
                 if (self.current_seen_prefix.items.len > 0 or i > 0) try seen_key.append(self.arena, '.');
                 try appendSeenSegment(self.arena, &seen_key, part);
+                if (self.key_spans != null) try self.recordKeySpan(full_key.items, part_spans.items[i], false);
                 // Duped into the seen-arena: stored into dotted_created /
                 // dotted_current and used as their lookup key, so it must
                 // outlive the per-unit value arena in the streaming path.
@@ -1237,6 +1287,7 @@ pub fn ParserOf(comptime Sink: type) type {
             if (self.current_prefix.items.len > 0 or parts.items.len > 1) try full_key.append(self.arena, '.');
             try full_key.appendSlice(self.arena, last);
             const fk_final = try self.arena.dupe(u8, full_key.items);
+            if (self.key_spans != null) try self.recordKeySpan(fk_final, part_spans.items[parts.items.len - 1], true);
             if (self.current_seen_prefix.items.len > 0 or parts.items.len > 1) try seen_key.append(self.arena, '.');
             try appendSeenSegment(self.arena, &seen_key, last);
             const seen_final = try self.arena.dupe(u8, seen_key.items);
@@ -1335,11 +1386,15 @@ pub fn ParserOf(comptime Sink: type) type {
             }
         }
 
-        fn parseKeyPath(self: *Self, out: *ArrayList([]const u8)) Error!void {
+        /// `out_spans`, when non-null, receives the source span of each
+        /// segment (quotes included), parallel to `out`.
+        fn parseKeyPath(self: *Self, out: *ArrayList([]const u8), out_spans: ?*ArrayList(Span)) Error!void {
             while (true) {
                 self.skipWs();
+                const start = self.pos;
                 const part = try self.parseOneKey();
                 try out.append(self.arena, part);
+                if (out_spans) |s| try s.append(self.arena, .{ .start = start, .end = self.pos });
                 self.skipWs();
                 if (!self.match('.')) return;
             }
@@ -2040,7 +2095,9 @@ pub fn ParserOf(comptime Sink: type) type {
                 if (self.match('}')) return .{ .table = tbl };
                 var parts: ArrayList([]const u8) = .empty;
                 defer parts.deinit(self.arena);
-                try self.parseKeyPath(&parts);
+                var part_spans: ArrayList(Span) = .empty;
+                defer part_spans.deinit(self.arena);
+                try self.parseKeyPath(&parts, if (self.key_spans != null) &part_spans else null);
                 self.skipWs();
                 if (!self.match('=')) return self.setError("expected '=' in inline table");
                 try self.skipWsAndComments();
@@ -2055,6 +2112,11 @@ pub fn ParserOf(comptime Sink: type) type {
                     try fkbuf.appendSlice(self.arena, part);
                     if (sealed.contains(fkbuf.items)) {
                         return self.setErrorFmt("cannot extend inline key '{s}'", .{fkbuf.items});
+                    }
+                    if (self.key_spans != null) {
+                        const prev = try self.pushPath('.', fkbuf.items);
+                        defer self.popPath(prev);
+                        try self.recordKeySpan(self.current_path.items, part_spans.items[i], false);
                     }
                     if (t.getPtr(part)) |existing| {
                         switch (existing.*) {
@@ -2078,6 +2140,7 @@ pub fn ParserOf(comptime Sink: type) type {
                 // Push `.fkbuf` onto current_path so parseValue records the
                 // span at the right path inside this inline table literal.
                 const prev = try self.pushPath('.', fkbuf.items);
+                if (self.key_spans != null) try self.recordKeySpan(self.current_path.items, part_spans.items[parts.items.len - 1], true);
                 const value = try self.parseValue();
                 self.popPath(prev);
 
@@ -2906,6 +2969,73 @@ test "spans: nested array element spans are byte-precise" {
     try testing.expectEqualStrings("[1, 2]", src[spans.get("matrix[0]").?.start..spans.get("matrix[0]").?.end]);
     try testing.expectEqualStrings("3", src[spans.get("matrix[1][0]").?.start..spans.get("matrix[1][0]").?.end]);
     try testing.expectEqualStrings("4", src[spans.get("matrix[1][1]").?.start..spans.get("matrix[1][1]").?.end]);
+}
+
+fn expectKeySpan(src: []const u8, key_spans: *const v.Spans, path: []const u8, text: []const u8, line: u32) !void {
+    const s = key_spans.get(path) orelse {
+        std.debug.print("no key span for `{s}`\n", .{path});
+        return error.TestExpectedEqual;
+    };
+    try testing.expectEqualStrings(text, src[@intCast(s.start)..@intCast(s.end)]);
+    try testing.expectEqual(line, s.lineCol(src).line);
+}
+
+test "key_spans: keys, headers, array-of-tables elements and implicit tables" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\title = "x"
+        \\a.b.c = 1
+        \\[server]
+        \\port = 80
+        \\[x.y]
+        \\z = 1
+        \\[x]
+        \\w = 2
+        \\[[points]]
+        \\"addr" = 1
+        \\[[points]]
+        \\addr = 2
+        \\inl = { k.m = 1, n = [{ o = 2 }] }
+    ;
+    var key_spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(), src, .{ .key_spans = &key_spans });
+
+    try expectKeySpan(src, &key_spans, "title", "title", 1);
+    // Dotted key: each segment, the implicit tables included.
+    try expectKeySpan(src, &key_spans, "a", "a", 2);
+    try expectKeySpan(src, &key_spans, "a.b", "b", 2);
+    try expectKeySpan(src, &key_spans, "a.b.c", "c", 2);
+    // Header table and its keys.
+    try expectKeySpan(src, &key_spans, "server", "server", 3);
+    try expectKeySpan(src, &key_spans, "server.port", "port", 4);
+    // `x` is created implicitly by `[x.y]`, then defined by `[x]`: the
+    // defining header wins.
+    try expectKeySpan(src, &key_spans, "x.y", "y", 5);
+    try expectKeySpan(src, &key_spans, "x", "x", 7);
+    // Array of tables: the array keeps its first header, each element its own.
+    try expectKeySpan(src, &key_spans, "points", "points", 9);
+    try expectKeySpan(src, &key_spans, "points[0]", "points", 9);
+    try expectKeySpan(src, &key_spans, "points[0].addr", "\"addr\"", 10);
+    try expectKeySpan(src, &key_spans, "points[1]", "points", 11);
+    try expectKeySpan(src, &key_spans, "points[1].addr", "addr", 12);
+    // Inline table keys, nested in an element and in an inline array.
+    try expectKeySpan(src, &key_spans, "points[1].inl", "inl", 13);
+    try expectKeySpan(src, &key_spans, "points[1].inl.k", "k", 13);
+    try expectKeySpan(src, &key_spans, "points[1].inl.k.m", "m", 13);
+    try expectKeySpan(src, &key_spans, "points[1].inl.n[0].o", "o", 13);
+}
+
+test "key_spans: value spans are unchanged when both maps are set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "[server]\nport = 80\n";
+    var spans: v.Spans = .empty;
+    var key_spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans, .key_spans = &key_spans });
+    const s = spans.get("server.port").?;
+    try testing.expectEqualStrings("80", src[@intCast(s.start)..@intCast(s.end)]);
+    try testing.expect(spans.get("server") == null);
 }
 
 test "spans: inline table value spans are byte-precise" {
