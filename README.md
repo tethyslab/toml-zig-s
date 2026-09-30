@@ -384,6 +384,10 @@ The parser collects every error in one pass when `errors` is set, up
 to 100 diagnostics per parse. Set it to `null` for single-error mode
 (bail on first error, no diagnostic captured).
 
+Typed decoding (`parseInto`, `decode`) does the same: with `errors` set it
+reports every unknown key and every field or element that fails to decode,
+each with its key path, and returns the first error.
+
 ## API surface
 
 ### Functions

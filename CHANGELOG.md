@@ -13,6 +13,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `field_types` / `field_attrs`), `@Tuple` replaces `std.meta.Tuple`,
   pointer constness is read from `attrs`, and `zig build fuzz -- …` forwards
   its arguments with `addPassthruArgs`.
+- Typed decoding (`parseInto` / `parseIntoReader` / `decode`) with an
+  `errors` sink no longer stops at the first problem: every unknown key,
+  every missing required field and every field or array element that fails
+  to decode gets a diagnostic, and the first error is returned. Without a
+  sink decoding still stops at the first error.
+
+### Fixed
+
+- A float field whose value is out of the target type's range
+  (`error.Overflow`) now gets a diagnostic.
 
 ## [0.6.0] - 2026-07-22
 

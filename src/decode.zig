@@ -21,6 +21,10 @@
 //! Field defaults satisfy missing-field cases. Optional fields (`?T`) become
 //! `null` when absent. Unknown TOML keys are an error by default; opt out
 //! with `ParseOptions{ .ignore_unknown_fields = true }`.
+//!
+//! Without `ParseOptions.errors` decoding stops at the first error. With it,
+//! decoding goes on past a failing key, field or element, so every unknown
+//! key and every decode error gets a diagnostic; the first error is returned.
 
 const std = @import("std");
 const compat = @import("compat.zig");
@@ -104,6 +108,15 @@ fn addDiag(
     args: anytype,
 ) Allocator.Error!void {
     return addDiagSuggest(arena, options, path, null, fmt, args);
+}
+
+/// With an errors sink, a decode error of one key, field or element is
+/// recorded in `first` (if it is the first one) and decoding goes on, so that
+/// every error gets its diagnostic; the caller returns `first` at the end.
+/// Without a sink, or on OutOfMemory, the error is returned at once.
+fn keepGoing(options: parser_mod.ParseOptions, first: *?DecodeError, err: DecodeError) DecodeError!void {
+    if (err == error.OutOfMemory or options.errors == null) return err;
+    if (first.* == null) first.* = err;
 }
 
 const annotations = @import("annotations.zig");
@@ -213,13 +226,19 @@ fn decodeFloat(comptime T: type, value: Value, arena: Allocator, options: parser
         .float => |f| blk: {
             const r: T = @floatCast(f);
             // Finite source -> inf result means the value overflowed the narrower type.
-            if (!std.math.isInf(f) and std.math.isInf(r)) return error.Overflow;
+            if (!std.math.isInf(f) and std.math.isInf(r)) {
+                try addDiag(arena, options, path, "float {e} out of range for {s}", .{ f, @typeName(T) });
+                return error.Overflow;
+            }
             break :blk r;
         },
         .integer => |n| blk: {
             const r: T = @floatFromInt(n);
             // Integer -> inf means the value exceeded the float type's finite range.
-            if (std.math.isInf(r)) return error.Overflow;
+            if (std.math.isInf(r)) {
+                try addDiag(arena, options, path, "integer {d} out of range for {s}", .{ n, @typeName(T) });
+                return error.Overflow;
+            }
             break :blk r;
         },
         else => {
@@ -244,11 +263,15 @@ fn decodePointer(comptime T: type, comptime p: std.builtin.Type.Pointer, arena: 
     }
     const items = value.array.items;
     const out = try arena.alloc(p.child, items.len);
+    var first: ?DecodeError = null;
     for (items, 0..) |item, i| {
         const prev = try path.pushIndex(arena, i);
         defer path.restore(prev);
-        out[i] = try decodeInner(p.child, arena, item, options, path);
+        if (decodeInner(p.child, arena, item, options, path)) |elem| {
+            out[i] = elem;
+        } else |err| try keepGoing(options, &first, err);
     }
+    if (first) |err| return err;
     return out;
 }
 
@@ -262,15 +285,19 @@ fn decodeArray(comptime T: type, comptime a: std.builtin.Type.Array, arena: Allo
         return error.TypeMismatch;
     }
     var out: T = undefined;
+    var first: ?DecodeError = null;
     // Guard prevents a compile error when T is [0]Child: Zig rejects
     // out[i] on a zero-length array even when the loop body is unreachable.
     if (comptime a.len > 0) {
         for (value.array.items, 0..) |item, i| {
             const prev = try path.pushIndex(arena, i);
             defer path.restore(prev);
-            out[i] = try decodeInner(a.child, arena, item, options, path);
+            if (decodeInner(a.child, arena, item, options, path)) |elem| {
+                out[i] = elem;
+            } else |err| try keepGoing(options, &first, err);
         }
     }
+    if (first) |err| return err;
     return out;
 }
 
@@ -285,9 +312,13 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
     }
     const tbl = value.table;
 
+    var first: ?DecodeError = null;
+
     // Unknown-field check runs before field assignment so that an
     // unrecognized key is reported as UnknownField rather than being
-    // shadowed by a subsequent MissingField on a required field.
+    // shadowed by a subsequent MissingField on a required field. With an
+    // errors sink every unknown key is reported, then the fields are still
+    // decoded so their errors are reported too.
     if (!options.ignore_unknown_fields) {
         var it = tbl.iterator();
         outer: while (it.next()) |entry| {
@@ -299,7 +330,7 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
             const suggestion = lev.closestMatch(key, comptime expectedKeys(T), lev.suggestionThreshold(key.len));
 
             try addDiagSuggest(arena, options, path, suggestion, "unknown field `{s}`", .{key});
-            return error.UnknownField;
+            try keepGoing(options, &first, error.UnknownField);
         }
     }
 
@@ -329,7 +360,9 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
                 .spans = options.spans,
                 .ignore_unknown_fields = true,
             };
-            @field(out, field.name) = try decodeInner(field.type, arena, value, flat_opts, path);
+            if (decodeInner(field.type, arena, value, flat_opts, path)) |fv| {
+                @field(out, field.name) = fv;
+            } else |err| try keepGoing(options, &first, err);
             seen[idx] = true;
             continue;
         }
@@ -337,7 +370,9 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
         if (tbl.get(eff_key)) |fv| {
             const prev = try path.pushSegment(arena, eff_key);
             defer path.restore(prev);
-            @field(out, field.name) = try decodeInner(field.type, arena, fv, options, path);
+            if (decodeInner(field.type, arena, fv, options, path)) |decoded| {
+                @field(out, field.name) = decoded;
+            } else |err| try keepGoing(options, &first, err);
             seen[idx] = true;
         } else if (field.defaultValue()) |dv| {
             @field(out, field.name) = dv;
@@ -347,10 +382,11 @@ fn decodeStruct(comptime T: type, comptime s: compat.Info, arena: Allocator, val
             seen[idx] = true;
         } else {
             try addDiag(arena, options, path, "missing required field `{s}`", .{field.name});
-            return error.MissingField;
+            try keepGoing(options, &first, error.MissingField);
         }
     }
 
+    if (first) |err| return err;
     return out;
 }
 
@@ -721,6 +757,114 @@ test "decode: nested type mismatch populates path" {
     try testing.expect(errs.items.len == 1);
     try testing.expect(errs.items[0].path != null);
     try testing.expectEqualStrings("server.port", errs.items[0].path.?);
+}
+
+test "decode: every unknown field is reported when errors are collected" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const v = try parse(arena.allocator(),
+        \\port = 8080
+        \\prt = 9090
+        \\hots = "x"
+        \\[extra]
+        \\k = 1
+    , .{});
+
+    const Config = struct { port: u16, host: []const u8 = "localhost" };
+    try testing.expectError(error.UnknownField, decode(Config, arena.allocator(), v, .{ .errors = &errs }));
+
+    try testing.expectEqual(@as(usize, 3), errs.items.len);
+    try testing.expectEqualStrings("unknown field `prt`", errs.items[0].message);
+    try testing.expectEqualStrings("unknown field `hots`", errs.items[1].message);
+    try testing.expectEqualStrings("host", errs.items[1].suggestion.?);
+    try testing.expectEqualStrings("unknown field `extra`", errs.items[2].message);
+}
+
+const collect_src =
+    \\name = 1
+    \\bogus = true
+    \\ports = [80, "443", 8080, -1]
+    \\ratio = 1e300
+    \\[server]
+    \\port = "8080"
+;
+
+const CollectConfig = struct {
+    name: []const u8,
+    id: u32,
+    ports: []const u16,
+    ratio: f32,
+    server: struct { host: []const u8 = "localhost", port: u16 },
+};
+
+fn expectCollectDiagnostics(errs: []const parser_mod.Diagnostic) !void {
+    const expected = [_]struct { path: ?[]const u8, message: []const u8 }{
+        .{ .path = null, .message = "unknown field `bogus`" },
+        .{ .path = "name", .message = "expected string, got integer" },
+        .{ .path = null, .message = "missing required field `id`" },
+        .{ .path = "ports[1]", .message = "expected integer, got string" },
+        .{ .path = "ports[3]", .message = "integer -1 out of range for u16" },
+        .{ .path = "ratio", .message = "float 1e300 out of range for f32" },
+        .{ .path = "server.port", .message = "expected integer, got string" },
+    };
+    try testing.expectEqual(expected.len, errs.len);
+    for (expected, errs) |e, d| {
+        try testing.expectEqualStrings(e.message, d.message);
+        if (e.path) |p| {
+            try testing.expectEqualStrings(p, d.path.?);
+        } else try testing.expectEqual(@as(?[]const u8, null), d.path);
+    }
+}
+
+test "decode: every field, element and nested error is reported when errors are collected" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const v = try parse(arena.allocator(), collect_src, .{});
+    // The first error (the unknown key) is the one returned.
+    try testing.expectError(error.UnknownField, decode(CollectConfig, arena.allocator(), v, .{ .errors = &errs }));
+    try expectCollectDiagnostics(errs.items);
+}
+
+test "decode: parseInto collects the same errors as decode" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const toml_mod = @import("toml.zig");
+    try testing.expectError(error.UnknownField, toml_mod.parseInto(CollectConfig, arena.allocator(), collect_src, .{ .errors = &errs }));
+    try expectCollectDiagnostics(errs.items);
+}
+
+test "decode: without an errors sink the first error is returned" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(),
+        \\name = "x"
+        \\id = "1"
+        \\ports = ["80"]
+    , .{});
+    const Config = struct { name: []const u8, id: u32, ports: []const u16 };
+    try testing.expectError(error.TypeMismatch, decode(Config, arena.allocator(), v, .{}));
+}
+
+test "decode: float overflow has a diagnostic" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const v = try parse(arena.allocator(), "ratio = 1e300", .{});
+    const Config = struct { ratio: f32 };
+    try testing.expectError(error.Overflow, decode(Config, arena.allocator(), v, .{ .errors = &errs }));
+    try testing.expectEqual(@as(usize, 1), errs.items.len);
+    try testing.expectEqualStrings("ratio", errs.items[0].path.?);
 }
 
 test "decode: toml_rename maps TOML key to struct field" {

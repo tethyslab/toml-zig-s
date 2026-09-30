@@ -117,6 +117,11 @@ pub const ParseOptions = struct {
     /// were collected. When null, parser bails on the first error with no
     /// error info captured.
     ///
+    /// Typed decoding (parseInto / parseIntoReader / decode) likewise goes
+    /// on past a failing key, field or array element when non-null, so
+    /// every unknown key and every decode error is appended; the first
+    /// decode error is returned. When null, it stops at the first error.
+    ///
     /// Ownership: the list's entries AND their string payloads (message,
     /// suggestion, ...) are allocated from the parse arena. Deinit the list
     /// with that arena's allocator, or simply drop it when the arena is
